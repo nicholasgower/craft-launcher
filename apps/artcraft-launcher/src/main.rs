@@ -34,6 +34,12 @@ const SETTINGS_KEY: &str = "settings";
 type Wake = Arc<OnceLock<Box<dyn Fn() + Send + Sync>>>;
 
 fn main() -> ExitCode {
+    // A `pkexec`-started helper for the system installer: no window, logging or single-instance
+    // claim, and it must stay ahead of everything else here.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    if let Some(code) = artcraft_launcher_native::install::root_helper::run_if_requested() {
+        return code;
+    }
     // First, so the panic report and every start-up warning are recorded (`logging`).
     let logs = logging::install();
     logging::install_panic_hook();

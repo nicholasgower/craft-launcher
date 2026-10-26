@@ -16,6 +16,10 @@
 //!   (`<data>/apps/<app>`) and run inside the same sandbox with `HOME` pointed at a `home/`
 //!   folder beside it, so the app's settings stay in the sandbox too.
 //!
+//! The first system install or removal asks for the password through polkit and starts a
+//! short-lived helper as root for the rest of the run (see `root_helper`), so updating
+//! several apps at once asks only once.
+//!
 //! Every download is checked against its published SHA-256 before anything is unpacked, a
 //! running app is never replaced, and a new copy is fully in place before the old one goes.
 
@@ -29,6 +33,9 @@ use crate::http::{Http, Stop, Transfer};
 use crate::manifest::Record;
 use crate::paths::Paths;
 use crate::process;
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub mod root_helper;
 
 /// What an install needs from the backend.
 pub struct Job<'a> {
@@ -720,12 +727,11 @@ fn pkexec() -> Option<PathBuf> {
 }
 
 /// Runs a command as root through polkit (`pkexec`), which shows the desktop's password prompt.
+/// The first one also starts the helper that later commands share, so the prompt is shown once
+/// for a run of installs and removals (see [`root_helper`]).
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn run_as_root(args: &[&std::ffi::OsStr]) -> Result<(), String> {
-    let args = with_absolute_program(&SYSTEM_BIN_DIRS, args)?;
-    let pkexec = pkexec().ok_or("installing system-wide needs polkit (pkexec), which isn't installed")?;
-    let status = process::command(pkexec).args(&args).status().map_err(|e| format!("couldn't ask for permission ({e})"))?;
-    root_outcome(status.code())
+    root_helper::run(args)
 }
 
 /// What `pkexec`'s exit code says about the command it ran.
@@ -779,10 +785,6 @@ pub(crate) mod linux {
         cancelled, find_in, pkexec, process, run_as_root, swap_into_place, tree, turn,
     };
 
-    /// apt waits this long for another package tool (a software centre, automatic updates) to
-    /// let go of its lock, instead of failing at once.
-    const APT_WAITS: &str = "DPkg::Lock::Timeout=60";
-
     /// A package tool that root commands can run, from the same directories `run_as_root` uses.
     fn system_tool(name: &str) -> Option<PathBuf> {
         find_in(&SYSTEM_BIN_DIRS, OsStr::new(name))
@@ -824,13 +826,14 @@ pub(crate) mod linux {
 
     /// The command that installs (or upgrades) a downloaded system package.
     pub fn install_command(kind: PackageKind) -> Option<&'static [&'static str]> {
+        use super::root_helper::{APT_INSTALL, DNF_INSTALL, PACMAN_INSTALL, RPM_INSTALL, ZYPPER_INSTALL};
         match kind {
             // apt resolves dependencies and records the package like any other.
-            PackageKind::Deb => Some(&["apt-get", "-o", APT_WAITS, "install", "-y", "--allow-downgrades"]),
-            PackageKind::Rpm if system_tool("dnf").is_some() => Some(&["dnf", "install", "-y"]),
-            PackageKind::Rpm if system_tool("zypper").is_some() => Some(&["zypper", "--non-interactive", "install", "--allow-unsigned-rpm"]),
-            PackageKind::Rpm => Some(&["rpm", "-U", "--replacepkgs"]),
-            PackageKind::ArchPkg => Some(&["pacman", "-U", "--noconfirm"]),
+            PackageKind::Deb => Some(APT_INSTALL),
+            PackageKind::Rpm if system_tool("dnf").is_some() => Some(DNF_INSTALL),
+            PackageKind::Rpm if system_tool("zypper").is_some() => Some(ZYPPER_INSTALL),
+            PackageKind::Rpm => Some(RPM_INSTALL),
+            PackageKind::ArchPkg => Some(PACMAN_INSTALL),
             _ => None,
         }
     }
@@ -955,19 +958,20 @@ pub(crate) mod linux {
     }
 
     pub fn remove_package(app: &CraftApp, installed: &Installed, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
+        use super::root_helper::{APT_REMOVE, DNF_REMOVE, DPKG_REMOVE, FLATPAK_SYSTEM_UNINSTALL, PACMAN_REMOVE, RPM_REMOVE};
         let mut remove = |command: &[&str], package: &str| as_root(&SYSTEM, command, OsStr::new(package), stop, phase, JobPhase::Removing);
         match installed.source {
-            InstallSource::Deb if system_tool("apt-get").is_some() => remove(&["apt-get", "-o", APT_WAITS, "remove", "-y"], app.id),
-            InstallSource::Deb => remove(&["dpkg", "-r"], app.id),
+            InstallSource::Deb if system_tool("apt-get").is_some() => remove(APT_REMOVE, app.id),
+            InstallSource::Deb => remove(DPKG_REMOVE, app.id),
             InstallSource::Rpm => {
                 if system_tool("dnf").is_some() {
-                    remove(&["dnf", "remove", "-y"], app.id)
+                    remove(DNF_REMOVE, app.id)
                 } else {
-                    remove(&["rpm", "-e"], app.id)
+                    remove(RPM_REMOVE, app.id)
                 }
             }
             // The package detected (photocraft, photocraft-bin or photocraft-git).
-            InstallSource::Pacman => remove(&["pacman", "-R", "--noconfirm"], installed.package.as_deref().unwrap_or(app.id)),
+            InstallSource::Pacman => remove(PACMAN_REMOVE, installed.package.as_deref().unwrap_or(app.id)),
             InstallSource::Flatpak => {
                 let id = app.bundle_id();
                 let user = process::flatpak_command().args(["uninstall", "--user", "-y", "--noninteractive", &id]).status();
@@ -981,7 +985,7 @@ pub(crate) mod linux {
                     }
                     return Err(format!("couldn't uninstall {id}"));
                 }
-                remove(&["flatpak", "uninstall", "--system", "-y", "--noninteractive"], &id)
+                remove(FLATPAK_SYSTEM_UNINSTALL, &id)
             }
             other => Err(format!("{} isn't a system package", other.label())),
         }
