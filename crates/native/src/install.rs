@@ -16,9 +16,10 @@
 //!   (`<data>/apps/<app>`) and run inside the same sandbox with `HOME` pointed at a `home/`
 //!   folder beside it, so the app's settings stay in the sandbox too.
 //!
-//! The first system install or removal asks for the password through polkit and starts a
-//! short-lived helper as root for the rest of the run (see `root_helper`), so updating
-//! several apps at once asks only once.
+//! The first system install or removal asks for permission — the polkit password prompt on
+//! Linux and FreeBSD, the one UAC prompt on Windows — and starts a short-lived helper as the
+//! privileged user for the rest of the run (see `root_helper` and `windows_helper`), so
+//! updating several apps at once asks only once.
 //!
 //! Every download is checked against its published SHA-256 before anything is unpacked, a
 //! running app is never replaced, and a new copy is fully in place before the old one goes.
@@ -36,6 +37,10 @@ use crate::process;
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub mod root_helper;
+#[cfg(windows)]
+pub mod windows_helper;
+#[cfg(any(windows, test))]
+pub(crate) mod windows_wire;
 
 /// What an install needs from the backend.
 pub struct Job<'a> {
@@ -1683,13 +1688,14 @@ pub(crate) fn msi_path(msi: &Path) -> Result<PathBuf, String> {
 pub mod windows {
     use artcraft_launcher_core::protocol::CANCELLED;
 
-    use super::{CraftApp, INSTALLER, JobPhase, Path, PathBuf, Stop, cancelled, msi_command, msi_folder_argument, msi_log, process, turn};
+    use super::{CraftApp, INSTALLER, JobPhase, Path, PathBuf, Stop, cancelled, msi_command, turn};
 
-    fn msiexec() -> PathBuf {
+    /// The Windows Installer, which the elevated helper runs once permission has been granted.
+    pub(super) fn msiexec() -> PathBuf {
         std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from).join(r"System32\msiexec.exe")
     }
 
-    fn explain(code: Option<i32>) -> Result<(), String> {
+    pub(super) fn explain(code: Option<i32>) -> Result<(), String> {
         match code {
             Some(0 | 3010 | 1641) => Ok(()),
             Some(1602) => Err("cancelled".into()),
@@ -1700,20 +1706,11 @@ pub mod windows {
         }
     }
 
-    /// Runs an MSI with a progress window and no restart. Windows asks for permission itself.
+    /// Runs an MSI with a progress window and no restart. The first one asks for administrator
+    /// permission once; the helper keeps that permission for the rest of the run (see
+    /// [`super::windows_helper`]).
     pub fn run_msi(msi: &Path, destination: Option<&Path>, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
-        in_turn(stop, phase, JobPhase::Installing, || {
-            use std::os::windows::process::CommandExt;
-            let mut command = msi_command(&msiexec(), msi)?;
-            if let Some(dir) = destination {
-                command.raw_arg(msi_folder_argument(dir)?);
-            }
-            let status = command.status().map_err(|e| format!("couldn't start the Windows Installer ({e})"))?;
-            explain(status.code()).map_err(|e| match status.code() {
-                Some(1602) | None => e,
-                _ => format!("{e}. Its log is at {}", msi_log(msi).display()),
-            })
-        })
+        in_turn(stop, phase, JobPhase::Installing, || super::windows_helper::install(msi, destination))
     }
 
     /// Runs the launcher's own new MSI for a self-update, with the same progress window and no
@@ -1736,11 +1733,7 @@ pub mod windows {
         }
         in_turn(stop, phase, JobPhase::Removing, || {
             for m in installs {
-                let status = process::command(msiexec())
-                    .args(["/x", &m.product_code, "/passive", "/norestart"])
-                    .status()
-                    .map_err(|e| format!("couldn't start the Windows Installer ({e})"))?;
-                explain(status.code())?;
+                super::windows_helper::uninstall(&m.product_code)?;
             }
             Ok(())
         })
