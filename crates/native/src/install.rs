@@ -17,9 +17,9 @@
 //!   folder beside it, so the app's settings stay in the sandbox too.
 //!
 //! The first system install or removal asks for permission — the polkit password prompt on
-//! Linux and FreeBSD, the one UAC prompt on Windows — and starts a short-lived helper as the
-//! privileged user for the rest of the run (see `root_helper` and `windows_helper`), so
-//! updating several apps at once asks only once.
+//! Linux, the one UAC prompt on Windows — and starts a short-lived helper as the privileged
+//! user for the rest of the run (see `root_helper` and `windows_helper`), so updating several
+//! apps at once asks only once. FreeBSD keeps one `pkexec` per command.
 //!
 //! Every download is checked against its published SHA-256 before anything is unpacked, a
 //! running app is never replaced, and a new copy is fully in place before the old one goes.
@@ -35,7 +35,7 @@ use crate::manifest::Record;
 use crate::paths::Paths;
 use crate::process;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(target_os = "linux")]
 pub mod root_helper;
 #[cfg(windows)]
 pub mod windows_helper;
@@ -102,7 +102,12 @@ pub fn install_at(
         return Err(format!("Cannot update {} to {}: installed version {} is newer", app.name, release.version_label(), inst_v));
     }
     log::info!("{}: starting {} to {} ({})", app.name, if existing.is_some() { "update" } else { "install" }, release.version_label(), kind.label());
-    let file = download(release, asset, job)?;
+    #[allow(unused_variables)]
+    let (file, sha) = download(release, asset, job)?;
+    // Linux stages a root-owned copy and checks it against this verified checksum; Windows
+    // carries it to the elevated helper. Other platforms don't need it past the download.
+    #[cfg(target_os = "linux")]
+    let _expected = root_helper::expect_hash(&file, &sha);
     log::info!("{}: download ready ({}), running installer...", app.name, file.display());
     // Past this point the install can't be interrupted halfway.
     (job.phase)(JobPhase::Installing);
@@ -115,7 +120,7 @@ pub fn install_at(
                 .map(|path| Some(record(&version, kind, path, Vec::new(), false)))
         }
         #[cfg(windows)]
-        PackageKind::Msi => windows::run_msi(&file, destination.as_deref(), job.stop, &mut *job.phase).map(|_| None),
+        PackageKind::Msi => windows::run_msi(&file, destination.as_deref(), job.stop, &mut *job.phase, Some(sha.as_str())).map(|_| None),
         #[cfg(windows)]
         PackageKind::PortableZip => {
             crate::portable::install(app, &file, &version, previous, job.paths, destination.as_deref(), job.replace, &mut |record| {
@@ -384,7 +389,7 @@ pub fn available_kinds() -> Vec<PackageKind> {
 /// Fetches `asset` into the download folder, checked against its published SHA-256: the feed's
 /// or GitHub's per-file digest, else the release's `SHA256SUMS.txt`. A release with neither is
 /// refused before anything is fetched: a file nothing vouches for is never installed (#90).
-pub(crate) fn download(release: &Release, asset: &Asset, job: &mut Job<'_>) -> Result<PathBuf, String> {
+pub(crate) fn download(release: &Release, asset: &Asset, job: &mut Job<'_>) -> Result<(PathBuf, String), String> {
     if !release::valid_file_name(&asset.name) {
         return Err("the release has an unexpected file name".into());
     }
@@ -405,7 +410,7 @@ pub(crate) fn download(release: &Release, asset: &Asset, job: &mut Job<'_>) -> R
         Transfer::Reconnecting { done, total } => phase(JobPhase::Reconnecting { done, total }),
     })?;
     (job.phase)(JobPhase::Verifying);
-    Ok(dest)
+    Ok((dest, sha))
 }
 
 /// The file's line in the release's `SHA256SUMS.txt`. `Ok(None)` only when the release really
@@ -733,10 +738,20 @@ fn pkexec() -> Option<PathBuf> {
 
 /// Runs a command as root through polkit (`pkexec`), which shows the desktop's password prompt.
 /// The first one also starts the helper that later commands share, so the prompt is shown once
-/// for a run of installs and removals (see [`root_helper`]).
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+/// for a run of installs and removals (see `root_helper`).
+#[cfg(target_os = "linux")]
 fn run_as_root(args: &[&std::ffi::OsStr]) -> Result<(), String> {
     root_helper::run(args)
+}
+
+/// FreeBSD has no shared helper: its two root commands (`cp` and `rm`) are not package-manager
+/// calls worth a session, so each uses its own `pkexec` prompt.
+#[cfg(target_os = "freebsd")]
+fn run_as_root(args: &[&std::ffi::OsStr]) -> Result<(), String> {
+    let args = with_absolute_program(&SYSTEM_BIN_DIRS, args)?;
+    let pkexec = pkexec().ok_or("installing system-wide needs polkit (pkexec), which isn't installed")?;
+    let status = process::command(pkexec).args(&args).status().map_err(|e| format!("couldn't ask for permission ({e})"))?;
+    root_outcome(status.code())
 }
 
 /// What `pkexec`'s exit code says about the command it ran.
@@ -1708,9 +1723,15 @@ pub mod windows {
 
     /// Runs an MSI with a progress window and no restart. The first one asks for administrator
     /// permission once; the helper keeps that permission for the rest of the run (see
-    /// [`super::windows_helper`]).
-    pub fn run_msi(msi: &Path, destination: Option<&Path>, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
-        in_turn(stop, phase, JobPhase::Installing, || super::windows_helper::install(msi, destination))
+    /// [`super::windows_helper`]). `expected` is the checksum the download was verified against.
+    pub fn run_msi(
+        msi: &Path,
+        destination: Option<&Path>,
+        stop: &Stop,
+        phase: &mut dyn FnMut(JobPhase),
+        expected: Option<&str>,
+    ) -> Result<(), String> {
+        in_turn(stop, phase, JobPhase::Installing, || super::windows_helper::install(msi, destination, expected))
     }
 
     /// Runs the launcher's own new MSI for a self-update, with the same progress window and no

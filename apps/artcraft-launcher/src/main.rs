@@ -35,9 +35,9 @@ type Wake = Arc<OnceLock<Box<dyn Fn() + Send + Sync>>>;
 
 fn main() -> ExitCode {
     // An elevated helper for the system installer: no window, logging or single-instance claim,
-    // and it must stay ahead of everything else here. Linux and FreeBSD start it through polkit;
-    // Windows through the one UAC prompt.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    // and it must stay ahead of everything else here. Linux starts it through polkit; Windows
+    // through the one UAC prompt.
+    #[cfg(target_os = "linux")]
     if let Some(code) = artcraft_launcher_native::install::root_helper::run_if_requested() {
         return code;
     }

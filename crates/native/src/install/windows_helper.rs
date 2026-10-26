@@ -49,11 +49,15 @@ pub fn run_if_requested() -> Option<ExitCode> {
 
 /// Installs `msi` as an administrator. The caller is already past the download check; this only
 /// fetches the install permission.
-pub fn install(msi: &Path, destination: Option<&Path>) -> Result<(), String> {
+pub fn install(msi: &Path, destination: Option<&Path>, expected: Option<&str>) -> Result<(), String> {
     if !msi.is_file() {
         return Err(format!("{} isn't a downloaded package", msi.display()));
     }
-    with_session(|session| session.install(msi, destination))
+    let expected = match expected {
+        Some(text) => Some(windows_wire::parse_sha256(text).ok_or_else(|| "the release checksum isn't a SHA-256".to_string())?),
+        None => None,
+    };
+    with_session(|session| session.install(msi, destination, expected))
 }
 
 /// Removes one MSI product as an administrator.
@@ -85,7 +89,7 @@ fn serve(port: u16, token: String) -> u8 {
             Err(_) => return 1,
         };
         let (outcome, intact) = match windows_wire::decode(&header) {
-            Ok(Request::Install { destination, length }) => install_package(&mut stream, destination, length, &token, counter),
+            Ok(Request::Install { destination, length, expected }) => install_package(&mut stream, destination, length, expected, &token, counter),
             Ok(Request::Uninstall { product }) => (uninstall_package(&product), true),
             Err(_) => return 1,
         };
@@ -148,7 +152,14 @@ fn read_frame(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, String> {
 /// Receives one MSI into the elevated account's temp folder, checks it and runs it. The second
 /// value says whether the connection is still at a request boundary; a short or failed transfer
 /// leaves it out of step, so the helper then exits.
-fn install_package(stream: &mut TcpStream, destination: Option<String>, length: u64, token: &str, counter: u32) -> (Result<(), String>, bool) {
+fn install_package(
+    stream: &mut TcpStream,
+    destination: Option<String>,
+    length: u64,
+    expected: Option<[u8; HASH_LENGTH]>,
+    token: &str,
+    counter: u32,
+) -> (Result<(), String>, bool) {
     let (temp, mut file) = match TempMsi::create(token, counter) {
         Ok(pair) => pair,
         Err(error) => return (Err(error), false),
@@ -175,12 +186,31 @@ fn install_package(stream: &mut TcpStream, destination: Option<String>, length: 
         return (Err(format!("couldn't save the installer ({error})")), false);
     }
     drop(file);
+    // Reopen read-only with `FILE_SHARE_READ` and keep that handle open while `msiexec` reads
+    // the package: no same-account process can replace it in the meantime.
+    let mut lock = match lock_msi(&temp.path) {
+        Ok(file) => file,
+        Err(error) => return (Err(error), false),
+    };
+    let stored = match hash_file(&mut lock) {
+        Ok(hash) => hash,
+        Err(error) => return (Err(error), false),
+    };
     let mut digest = [0u8; HASH_LENGTH];
     if let Err(error) = stream.read_exact(&mut digest) {
         return (Err(format!("couldn't verify the installer ({error})")), false);
     }
-    if hasher.finalize().as_slice() != &digest[..] {
+    let received = hasher.finalize();
+    if received.as_slice() != &digest[..] {
         return (Err("the installer changed on its way to the permission helper".into()), true);
+    }
+    if stored.as_slice() != received.as_slice() {
+        return (Err("the installer changed on disk before it could run".into()), true);
+    }
+    if let Some(expected) = expected
+        && stored != expected
+    {
+        return (Err("the installer doesn't match the release checksum".into()), true);
     }
     let destination = match destination {
         Some(destination) => {
@@ -203,6 +233,31 @@ fn install_package(stream: &mut TcpStream, destination: Option<String>, length: 
 /// beside the canonical path rather than the path this module created.
 fn log_path(msi: &Path) -> PathBuf {
     super::msi_path(msi).map_or_else(|_| super::msi_log(msi), |path| super::msi_log(path.as_path()))
+}
+
+/// Opens the staged MSI read-only and keeps other processes from writing or deleting it.
+fn lock_msi(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(path).map_err(|error| format!("couldn't lock the installer ({error})"))
+}
+
+fn hash_file(file: &mut std::fs::File) -> Result<[u8; HASH_LENGTH], String> {
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start(0)).map_err(|error| format!("couldn't verify the installer ({error})"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 << 10];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(format!("couldn't verify the installer ({error})")),
+        }
+    }
+    let mut hash = [0u8; HASH_LENGTH];
+    hash.copy_from_slice(hasher.finalize().as_slice());
+    Ok(hash)
 }
 
 fn install_msi(temp: &Path, destination: Option<&Path>) -> Result<(), String> {
@@ -261,11 +316,15 @@ struct TempMsi {
 
 impl TempMsi {
     fn create(token: &str, counter: u32) -> Result<(Self, std::fs::File), String> {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Only readers may share this file while the helper holds it open: no writer or deleter
+        // can replace the package between the digest check and `msiexec`.
+        const FILE_SHARE_READ: u32 = 0x1;
         let directory = std::env::temp_dir();
         let prefix: String = token.chars().take(16).collect();
         for attempt in 0..16u32 {
             let path = directory.join(format!("artcraft-update-{prefix}-{counter}-{attempt}.msi"));
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            match std::fs::OpenOptions::new().write(true).create_new(true).share_mode(FILE_SHARE_READ).open(&path) {
                 Ok(file) => return Ok((Self { path }, file)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(format!("couldn't prepare the installer ({error})")),
@@ -307,6 +366,9 @@ enum Reply {
 /// Runs `work` against the helper, starting it (and with it the one UAC prompt) if needed.
 fn with_session(work: impl FnOnce(&mut Session) -> Reply) -> Result<(), String> {
     let mut slot = lock();
+    if slot.as_ref().is_some_and(|session| !session.alive()) {
+        *slot = None;
+    }
     if slot.is_none() {
         *slot = Some(Session::start()?);
     }
@@ -373,7 +435,18 @@ impl Session {
         }
     }
 
-    fn install(&mut self, msi: &Path, destination: Option<&Path>) -> Reply {
+    /// Whether the helper is still connected (it exits after being idle for `IDLE`).
+    fn alive(&self) -> bool {
+        if self.stream.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let mut probe = [0u8; 1];
+        let alive = matches!(self.stream.peek(&mut probe), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock);
+        let _ = self.stream.set_nonblocking(false);
+        alive
+    }
+
+    fn install(&mut self, msi: &Path, destination: Option<&Path>, expected: Option<[u8; HASH_LENGTH]>) -> Reply {
         let destination = match destination {
             Some(path) => match path.to_str() {
                 Some(text) => Some(text),
@@ -389,7 +462,7 @@ impl Session {
             Ok(metadata) => metadata.len(),
             Err(error) => return Reply::Done(Err(format!("couldn't read the installer ({error})"))),
         };
-        let header = match windows_wire::encode_install(destination, length) {
+        let header = match windows_wire::encode_install(destination, length, expected.as_ref()) {
             Ok(header) => header,
             Err(error) => return Reply::Done(Err(error)),
         };

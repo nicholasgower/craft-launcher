@@ -16,12 +16,13 @@ pub(crate) const MAX_MSI: u64 = 2 << 30; // 2 GiB
 /// One thing the helper may be asked to do.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Request {
-    Install { destination: Option<String>, length: u64 },
+    Install { destination: Option<String>, length: u64, expected: Option<[u8; 32]> },
     Uninstall { product: String },
 }
 
-/// An install header: the optional install folder, then the package length.
-pub(crate) fn encode_install(destination: Option<&str>, length: u64) -> Result<Vec<u8>, String> {
+/// An install header: the optional install folder, the package length, and the release checksum
+/// the launcher verified the download against.
+pub(crate) fn encode_install(destination: Option<&str>, length: u64, expected: Option<&[u8; 32]>) -> Result<Vec<u8>, String> {
     if length == 0 || length > MAX_MSI {
         return Err("the package is too large".into());
     }
@@ -39,6 +40,13 @@ pub(crate) fn encode_install(destination: Option<&str>, length: u64) -> Result<V
         None => out.push(0),
     }
     out.extend_from_slice(&length.to_be_bytes());
+    match expected {
+        Some(expected) => {
+            out.push(1);
+            out.extend_from_slice(expected);
+        }
+        None => out.push(0),
+    }
     Ok(out)
 }
 
@@ -78,7 +86,15 @@ pub(crate) fn decode(header: &[u8]) -> Result<Request, String> {
             if length == 0 || length > MAX_MSI {
                 return Err("the package is too large".into());
             }
-            Request::Install { destination, length }
+            let expected = match reader.u8()? {
+                0 => None,
+                1 => {
+                    let bytes = reader.bytes(32)?;
+                    Some(<[u8; 32]>::try_from(bytes).map_err(|_| "truncated installer checksum")?)
+                }
+                _ => return Err("unknown installer checksum".into()),
+            };
+            Request::Install { destination, length, expected }
         }
         KIND_UNINSTALL => {
             let length = reader.u32()? as usize;
@@ -95,6 +111,18 @@ pub(crate) fn decode(header: &[u8]) -> Result<Request, String> {
         return Err("trailing request data".into());
     }
     Ok(request)
+}
+
+/// The release's SHA-256 as hex, for the header.
+pub(crate) fn parse_sha256(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (index, chunk) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        out[index] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Product codes are GUIDs from the Windows Installer registry; nothing else may reach `msiexec
@@ -143,10 +171,24 @@ mod tests {
 
     #[test]
     fn installs_round_trip() {
+        let checksum = [0x5a; 32];
         for destination in [None, Some(r"C:\Program Files\PhotoCraft")] {
-            let header = encode_install(destination, 12345).expect("a small install request");
-            assert_eq!(decode(&header), Ok(Request::Install { destination: destination.map(str::to_string), length: 12345 }));
+            for expected in [None, Some(&checksum)] {
+                let header = encode_install(destination, 12345, expected).expect("a small install request");
+                assert_eq!(
+                    decode(&header),
+                    Ok(Request::Install { destination: destination.map(str::to_string), length: 12345, expected: expected.copied() })
+                );
+            }
         }
+    }
+
+    #[test]
+    fn checksums_are_read_from_hex() {
+        let text = "5a".repeat(32);
+        assert_eq!(parse_sha256(&text), Some([0x5a; 32]));
+        assert_eq!(parse_sha256(&text[..63]), None);
+        assert_eq!(parse_sha256(&"zz".repeat(32)), None);
     }
 
     #[test]
@@ -163,21 +205,24 @@ mod tests {
         assert!(decode(&[KIND_INSTALL, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err(), "unknown destination flag");
         assert!(decode(&[KIND_UNINSTALL, 0, 0, 0, 1, b'-']).is_err(), "an option isn't a product code");
         assert!(decode(&[KIND_UNINSTALL, 0, 0, 0, 1, b'a', 0]).is_err(), "trailing data");
-        let mut header = encode_install(None, 1).expect("a small request");
+        let mut header = encode_install(None, 1, None).expect("a small request");
         header.push(0);
         assert!(decode(&header).is_err());
         assert!(decode(&[KIND_UNINSTALL, 0, 0, 0, 0]).is_err(), "no product code");
         // An install header that ends before its length.
         assert!(decode(&[KIND_INSTALL, 0, 0, 0, 0, 0]).is_err());
+        // An unknown checksum flag, and a checksum that ends early.
+        assert!(decode(&[KIND_INSTALL, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2]).is_err());
+        assert!(decode(&[KIND_INSTALL, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 2]).is_err());
     }
 
     #[test]
     fn oversized_requests_are_refused() {
-        assert!(encode_install(None, 0).is_err());
-        assert!(encode_install(None, MAX_MSI + 1).is_err());
+        assert!(encode_install(None, 0, None).is_err());
+        assert!(encode_install(None, MAX_MSI + 1, None).is_err());
         let long = "a".repeat(MAX_DESTINATION + 1);
-        assert!(encode_install(Some(&long), 1).is_err());
-        assert!(encode_install(Some("bad\0folder"), 1).is_err());
+        assert!(encode_install(Some(&long), 1, None).is_err());
+        assert!(encode_install(Some("bad\0folder"), 1, None).is_err());
         let long = "a".repeat(MAX_PRODUCT + 1);
         assert!(encode_uninstall(&long).is_err());
     }
